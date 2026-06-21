@@ -3,6 +3,7 @@
 #include "ServoTimer2.h"
 #include "Settings2.h"
 
+// DEBUG KAPALI — Serial, PacketSerial tarafından kullanılıyor.
 // #define DEBUG
 
 #define MY_NODE_ID 2
@@ -51,6 +52,11 @@ unsigned long lastSendTime = 0;
 unsigned long lastPacketReceivedTime = 0;
 const unsigned long FAILSAFE_TIMEOUT_MS = 500;
 
+// Hareketli ortalama filtresi (sensör gürültüsü için)
+#define FILTER_SIZE 5
+int8_t speedBuffer[FILTER_SIZE] = {0};
+uint8_t filterIndex = 0;
+
 // -------------------------------------------------------
 // FORWARD DECLARATIONS
 // -------------------------------------------------------
@@ -97,6 +103,15 @@ uint8_t getSpeedScaled() {
     return constrain((int)round(mapped), 0, SPEED_RES);
 }
 
+
+int8_t getFilteredSpeed() {
+    speedBuffer[filterIndex] = getSpeedScaled() * (lastGear == FORWARD ? 1 : -1);
+    filterIndex = (filterIndex + 1) % FILTER_SIZE;
+    int16_t sum = 0;
+    for (uint8_t i = 0; i < FILTER_SIZE; i++) sum += speedBuffer[i];
+    return (int8_t)(sum / FILTER_SIZE);
+}
+
 void setSpeedScaled(uint8_t _speed) {
     uint8_t speed = constrain(_speed, 0, SPEED_RES);
     if (speed == 0) {
@@ -110,7 +125,8 @@ void setSpeedScaled(uint8_t _speed) {
 // KONTROL DÖNGÜSÜ
 // -------------------------------------------------------
 void handleControl() {
-    float hata = abs(targetSpeed) - abs(currentSpeed);
+    // FIX 1: float cast — abs() integer overflow'unu önler
+    float hata = (float)abs(targetSpeed) - (float)abs(currentSpeed);
     int pwm_komut = 0;
     int fren_komut_yuzdesi = 0;
 
@@ -195,6 +211,7 @@ void handleControl() {
         case STATE_CRUISING: {
             fren_komut_yuzdesi = 0;
             integral_hata += hata * dt;
+            integral_hata = constrain(integral_hata, -50.0, 50.0);
             float pi_cikis = (Kp * hata) + (Ki * integral_hata);
             pwm_komut = (int)constrain(pi_cikis * 2, 0, SPEED_RES);
             if (pwm_komut > onceki_pwm + RAMPA_ADIMI) {
@@ -273,7 +290,6 @@ void setup() {
     pinMode(MOTOR_PIN, OUTPUT);
     pinMode(GEAR_PIN,  OUTPUT);
     pinMode(READ_PIN,  INPUT);
-    pinMode(11,        OUTPUT);
 
     setSpeedScaled(0);
     setBrakeDynamic(100);
@@ -285,7 +301,8 @@ void setup() {
 void loop() {
     mySerial.update();
 
-    currentSpeed = getSpeedScaled() * (lastGear == FORWARD ? 1 : -1);
+    // FIX 3: Ham analogRead yerine filtrelenmiş hız kullanılıyor
+    currentSpeed = getFilteredSpeed();
 
     // FAILSAFE: 500ms'den uzun süre paket gelmezse dur
     if (millis() - lastPacketReceivedTime > FAILSAFE_TIMEOUT_MS) {

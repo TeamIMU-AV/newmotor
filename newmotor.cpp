@@ -39,17 +39,23 @@ int prepareBrakePercent = 100;                   // fren yüzdesi kademeli düş
 // Ana döngü zamanlayıcısı
 unsigned long eski_zaman = 0;
 
-// Sensör gürültüsüne / ani sıçramaya karşı güvenlik payı: DECELERATING'den
-// IDLE'a geçmeden önce hızın art arda kaç döngü boyunca sıfır göründüğünü
-// sayıyoruz. Tek bir hatalı/gürültülü okuma yüzünden erken IDLE'a (ve
-// dolayısıyla başka bir state'e) geçilmesini önler.
+// Sensör gürültüsüne / ani sıçramaya karşı güvenlik payı
 uint8_t zeroSpeedStreak = 0;
-const uint8_t ZERO_SPEED_CONFIRM_COUNT = 3; // ~3 x 100ms = 300ms boyunca teyit
+const uint8_t ZERO_SPEED_CONFIRM_COUNT = 3;
 
 // -------------------------------------------------------
-// PACKETSERIAL HABERLEŞME (main (6).cpp formatı)
+// PACKETSERIAL HABERLEŞME
 // -------------------------------------------------------
-// Paket yapısı Node 2 için: [ID(1)][target_speed(2)][CRC32(4)] = 7 byte
+// CommCaster.py paket formatı:
+//   [node_id(1)] [cmd(1)] [payload(2)] [CRC32(4)] = 8 byte
+//
+// Geri bildirim paketi (feedback):
+//   [node_id(1)] [cmd(1)] [payload(2)] [CRC32(4)] = 8 byte
+//
+// CommCaster.py CMD sabitleri:
+#define CMD_SET_SPEED    0x21
+#define CMD_REPORT_SPEED 0x22
+
 unsigned long lastSendTime = 0;
 unsigned long lastPacketReceivedTime = 0;
 const unsigned long FAILSAFE_TIMEOUT_MS = 500;
@@ -84,9 +90,6 @@ void triggerLed() {
 // -------------------------------------------------------
 // DONANIM SOYUTLAMA KATMANI (FİZİKSEL ÇIKIŞLAR)
 // -------------------------------------------------------
-// Arduino'nun map() fonksiyonu long tabanlıdır ve ondalıklı değerlerde
-// hassasiyet kaybına yol açar. Float hassasiyetiyle çalışan kendi
-// versiyonumuzu kullanıyoruz.
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
@@ -106,7 +109,6 @@ uint8_t getSpeedScaled() {
    float mapped = mapFloat(scaled, SPEED_IN_MIN, SPEED_IN_MAX, 0, SPEED_RES);
     if (scaled < 5) return 0;
     return constrain((int)round(mapped), 0, SPEED_RES);
-
 }
 
 void setSpeedScaled(uint8_t _speed) {
@@ -119,8 +121,9 @@ void setSpeedScaled(uint8_t _speed) {
 }
 
 
-// OTONOM KONTROL DÖNGÜSÜ (BEYİN) 
-
+// -------------------------------------------------------
+// OTONOM KONTROL DÖNGÜSÜ (BEYİN)
+// -------------------------------------------------------
 void handleControl() {
     float hata = abs(targetSpeed) - abs(currentSpeed);
     int pwm_komut        = 0;
@@ -161,11 +164,6 @@ void handleControl() {
 
         case STATE_CRUISING:
             if (targetSpeed == 0) {
-                // DÜZELTME: Doğrudan IDLE'a atlamak ani %100 fren anlamına
-                // geliyordu (örn. failsafe tetiklendiğinde). Artık önce
-                // DECELERATING/BRAKING'e girip kademeli yavaşlama yapılıyor;
-                // araç gerçekten durduğunda DECELERATING zaten kendisi
-                // IDLE'a düşürüyor 
                 carState = STATE_DECELERATING;
                 subState = SUB_BRAKING;
                 zeroSpeedStreak = 0;
@@ -184,17 +182,14 @@ void handleControl() {
             }
 
             if (zeroSpeedStreak >= ZERO_SPEED_CONFIRM_COUNT) {
-                
                 carState = STATE_IDLE;
                 subState = SUB_NONE;
                 zeroSpeedStreak = 0;
             } else if (targetSpeed != 0 && hata >= -1.0) {
-                
                 carState = STATE_CRUISING;
                 subState = SUB_NONE;
                 zeroSpeedStreak = 0;
             } else {
-                // Hâlâ hareket halindeyiz, kademeli yavaşlamaya devam et.
                 subState = (abs(hata) > 8.0) ? SUB_BRAKING : SUB_COASTING;
             }
             break;
@@ -263,43 +258,45 @@ void handleControl() {
 // PACKETSERIAL ALICI / VERİCİ
 // -------------------------------------------------------
 void onPacketReceived(const uint8_t* buffer, size_t size) {
-  // Beklenen boyut: ID(1) + target_speed(2) + CRC32(4) = 7 byte
-  if (size < 5) return;
+  // FIX: CommCaster.py formatı: [node_id(1)][cmd(1)][payload(2)][CRC32(4)] = 8 byte
+  if (size < 8) return;
 
+  // Son 4 byte CRC
   uint32_t receivedCRC;
   memcpy(&receivedCRC, buffer + (size - 4), 4);
   uint32_t calculatedCRC = calculateCRC32(buffer, size - 4);
 
-  if (receivedCRC == calculatedCRC) {
-    uint8_t incoming_id = buffer[0];
+  if (receivedCRC != calculatedCRC) return;
 
-    if (incoming_id == MY_NODE_ID) {
-      lastPacketReceivedTime = millis(); // Failsafe zamanlayıcısını resetle
+  uint8_t incoming_id  = buffer[0];
+  uint8_t incoming_cmd = buffer[1];  // FIX: cmd byte okunuyor
 
-      memcpy(&target_speed, buffer + 1, 2);
+  if (incoming_id == MY_NODE_ID && incoming_cmd == CMD_SET_SPEED) {
+    lastPacketReceivedTime = millis();
+
+    
+    memcpy(&target_speed, buffer + 2, 2);
 
 #ifdef DEBUG
-      triggerLed();
+    triggerLed();
 #endif
 
-      // State machine int8_t bekliyor (orijinal koddaki gibi), bu yüzden
-      // gelen int16_t değeri SPEED_RES aralığına sıkıştırıp aktarıyoruz.
-      targetSpeed = (int8_t)constrain(target_speed, -SPEED_RES, SPEED_RES);
-    }
+    targetSpeed = (int8_t)constrain(target_speed, -SPEED_RES, SPEED_RES);
   }
 }
 
 void sendFeedbackData() {
-  uint8_t payload[3];
+  uint8_t payload[4];
   payload[0] = MY_NODE_ID;
+  payload[1] = CMD_REPORT_SPEED;
   int16_t feedback_value = currentSpeed;
-  memcpy(payload + 1, &feedback_value, 2);
+  memcpy(payload + 2, &feedback_value, 2);
 
-  uint32_t crc = calculateCRC32(payload, 3);
+  uint32_t crc = calculateCRC32(payload, 4);
 
-  uint8_t packet[7];
-  memcpy(packet, payload, 3);
-  memcpy(packet + 3, &crc, 4);
+  uint8_t packet[8];
+  memcpy(packet, payload, 4);
+  memcpy(packet + 4, &crc, 4);
 
   mySerial.send(packet, sizeof(packet));
 }
@@ -326,8 +323,6 @@ void setup() {
     setBrakeDynamic(100);
     setGear(FORWARD);
 
-    // Failsafe zamanlayıcısını başlangıçta da set et; aksi halde
-    // ilk 500ms içinde hiç paket gelmezse anında failsafe tetiklenir.
     lastPacketReceivedTime = millis();
 }
 
@@ -337,14 +332,11 @@ void loop() {
     currentSpeed = getSpeedScaled() * (lastGear == FORWARD ? 1 : -1);
 
     // HARDWARE FAILSAFE
-    // Mega'dan FAILSAFE_TIMEOUT_MS süresinden uzun süre paket gelmezse
-    // hedef hız sıfırlanır. State machine otomatik olarak STATE_IDLE'a
-    // düşer ve freni devreye alır (orijinal mantık aynen korunuyor).
     if (millis() - lastPacketReceivedTime > FAILSAFE_TIMEOUT_MS) {
         targetSpeed = 0;
     }
 
-    // Mega'ya hız geri bildirimini 50Hz'de gönder (main (6).cpp'deki gibi)
+    // Mega'ya hız geri bildirimini 50Hz'de gönder
     if (millis() - lastSendTime > 20) {
         sendFeedbackData();
         lastSendTime = millis();
@@ -353,6 +345,6 @@ void loop() {
     unsigned long su_anki_zaman = millis();
     if (su_anki_zaman - eski_zaman >= 100) {
         eski_zaman = su_anki_zaman;
-        handleControl(); // 100ms'de bir beyni çalıştırır
+        handleControl();
     }
 }

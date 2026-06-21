@@ -7,16 +7,16 @@
 #define BRAKE_PIN 3
 #define MOTOR_PIN 9
 #define GEAR_PIN  8
-#define READ_PIN  14  // A0
+#define READ_PIN  14  // A0 — Hall sensörü
 
 // -------------------------------------------------------
 // HIZ AYARLARI
 // -------------------------------------------------------
 #define SPEED_RES     100   // PWM çözünürlüğü (0-100)
-#define SPEED_OUT_MIN 180   // Motor minimum PWM (harekete başlama eşiği)
+#define SPEED_OUT_MIN 180   // Motor minimum PWM
 #define SPEED_OUT_MAX 255   // Motor maksimum PWM
-#define SPEED_IN_MIN  10    // Encoder/sensör minimum okuması
-#define SPEED_IN_MAX  100   // Encoder/sensör maksimum okuması
+#define SPEED_IN_MIN  2     // Hall sensörü min pulse/sn (durma eşiği)
+#define SPEED_IN_MAX  50    // Hall sensörü max pulse/sn — sahada ayarla
 
 // -------------------------------------------------------
 // FREN SERVO AYARLARI
@@ -28,10 +28,10 @@
 // ENUM TANIMLARI
 // -------------------------------------------------------
 enum CarState {
-    STATE_IDLE,         // Araç duruyor, fren %100, motor 0
-    STATE_PREPARING,    // Fren kademeli bırakılıyor, vites seçiliyor
-    STATE_CRUISING,     // Serbest sürüş, PI kontrolcü aktif
-    STATE_DECELERATING  // Yavaşlama (COASTING veya BRAKING)
+    STATE_IDLE,
+    STATE_PREPARING,
+    STATE_CRUISING,
+    STATE_DECELERATING
 };
 
 enum SubState {

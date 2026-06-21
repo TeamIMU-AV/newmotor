@@ -8,9 +8,11 @@
 
 #define MY_NODE_ID 2
 
-// CommCaster.py CMD sabitleri
 #define CMD_SET_SPEED    0x21
 #define CMD_REPORT_SPEED 0x22
+
+// Mıknatıs sayısı bilinmiyor — sahada ayarla
+#define MAGNET_COUNT 1
 
 PacketSerial mySerial;
 ServoTimer2 brakeServo;
@@ -35,6 +37,10 @@ static int onceki_pwm = 0;
 
 int RAMPA_ADIMI = 15;
 
+// Kalkış boost — 190 PWM karşılığı SPEED_RES cinsinden
+// map(190, SPEED_OUT_MIN=180, SPEED_OUT_MAX=255, 1, 100) ≈ 13
+#define BOOST_PWM 13
+
 // PREPARING zamanlayıcısı
 unsigned long prepareStartTime = 0;
 const unsigned long PREPARE_DURATION_MS = 400;
@@ -52,10 +58,9 @@ unsigned long lastSendTime = 0;
 unsigned long lastPacketReceivedTime = 0;
 const unsigned long FAILSAFE_TIMEOUT_MS = 500;
 
-// Hareketli ortalama filtresi (sensör gürültüsü için)
-#define FILTER_SIZE 5
-int8_t speedBuffer[FILTER_SIZE] = {0};
-uint8_t filterIndex = 0;
+// Hall sensörü pulse sayacı
+volatile uint32_t pulseCount = 0;
+unsigned long lastSpeedCalcTime = 0;
 
 // -------------------------------------------------------
 // FORWARD DECLARATIONS
@@ -63,6 +68,7 @@ uint8_t filterIndex = 0;
 void onPacketReceived(const uint8_t* buffer, size_t size);
 void sendFeedbackData();
 uint32_t calculateCRC32(const uint8_t *data, size_t length);
+void hallISR();
 
 // -------------------------------------------------------
 // CRC32
@@ -96,20 +102,31 @@ void setBrakeDynamic(int yuzde) {
     brakeServo.write(servo_sinyali);
 }
 
-uint8_t getSpeedScaled() {
-    float scaled = analogRead(READ_PIN) / 5.0;
-    float mapped = mapFloat(scaled, SPEED_IN_MIN, SPEED_IN_MAX, 0, SPEED_RES);
-    if (scaled < 5) return 0;
-    return constrain((int)round(mapped), 0, SPEED_RES);
+// Hall sensörü interrupt handler
+void hallISR() {
+    pulseCount++;
 }
 
+// Hall sensöründen hız hesapla (SPEED_RES cinsinden 0-100)
+int8_t getSpeedFromHall() {
+    unsigned long now = millis();
+    unsigned long elapsed = now - lastSpeedCalcTime;
 
-int8_t getFilteredSpeed() {
-    speedBuffer[filterIndex] = getSpeedScaled() * (lastGear == FORWARD ? 1 : -1);
-    filterIndex = (filterIndex + 1) % FILTER_SIZE;
-    int16_t sum = 0;
-    for (uint8_t i = 0; i < FILTER_SIZE; i++) sum += speedBuffer[i];
-    return (int8_t)(sum / FILTER_SIZE);
+    if (elapsed < 100) return currentSpeed; // henüz hesaplama zamanı gelmedi
+
+    noInterrupts();
+    uint32_t count = pulseCount;
+    pulseCount = 0;
+    interrupts();
+    lastSpeedCalcTime = now;
+
+    // pulse/saniye → SPEED_RES cinsine çevir
+    // elapsed ms içinde count pulse geldi
+    float pps = (float)count / (elapsed / 1000.0) / MAGNET_COUNT;
+
+    // pps → 0-100 arası hız (SPEED_IN_MIN/MAX ile kalibre et)
+    float mapped = mapFloat(pps, SPEED_IN_MIN, SPEED_IN_MAX, 0, SPEED_RES);
+    return (int8_t)constrain((int)round(mapped), 0, SPEED_RES);
 }
 
 void setSpeedScaled(uint8_t _speed) {
@@ -125,12 +142,10 @@ void setSpeedScaled(uint8_t _speed) {
 // KONTROL DÖNGÜSÜ
 // -------------------------------------------------------
 void handleControl() {
-    // FIX 1: float cast — abs() integer overflow'unu önler
     float hata = (float)abs(targetSpeed) - (float)abs(currentSpeed);
     int pwm_komut = 0;
     int fren_komut_yuzdesi = 0;
 
-    // --- STATE GEÇİŞ KARARLARI ---
     switch (carState) {
 
         case STATE_IDLE:
@@ -156,6 +171,8 @@ void handleControl() {
                     prepareBrakePercent = 0;
                     carState            = STATE_CRUISING;
                     integral_hata       = 0.0;
+                    // Kalkış boost: 0 yerine 190 PWM karşılığından başla
+                    onceki_pwm          = BOOST_PWM;
                 }
             }
             break;
@@ -192,7 +209,6 @@ void handleControl() {
             break;
     }
 
-    // --- FİZİKSEL ÇIKTILAR ---
     switch (carState) {
 
         case STATE_IDLE:
@@ -205,7 +221,6 @@ void handleControl() {
         case STATE_PREPARING:
             fren_komut_yuzdesi = prepareBrakePercent;
             setSpeedScaled(0);
-            onceki_pwm = 0;
             break;
 
         case STATE_CRUISING: {
@@ -238,7 +253,6 @@ void handleControl() {
 
 // -------------------------------------------------------
 // PACKETSERIAL ALICI
-// Paket formatı: [node_id(1)][cmd(1)][payload(2)][CRC32(4)] = 8 byte
 // -------------------------------------------------------
 void onPacketReceived(const uint8_t* buffer, size_t size) {
     if (size < 8) return;
@@ -260,7 +274,6 @@ void onPacketReceived(const uint8_t* buffer, size_t size) {
 
 // -------------------------------------------------------
 // PACKETSERIAL VERİCİ
-// Feedback formatı: [node_id(1)][cmd(1)][payload(2)][CRC32(4)] = 8 byte
 // -------------------------------------------------------
 void sendFeedbackData() {
     uint8_t payload[4];
@@ -291,20 +304,41 @@ void setup() {
     pinMode(GEAR_PIN,  OUTPUT);
     pinMode(READ_PIN,  INPUT);
 
+    // Hall sensörü interrupt — READ_PIN (14/A0) interrupt-capable değil
+    // Bu yüzden digitalRead ile polling yapıyoruz, interrupt yerine
+    // Eğer ileride pin 2'ye taşınırsa: attachInterrupt(digitalPinToInterrupt(2), hallISR, RISING);
+
     setSpeedScaled(0);
     setBrakeDynamic(100);
     setGear(FORWARD);
 
     lastPacketReceivedTime = millis();
+    lastSpeedCalcTime = millis();
+}
+
+// Hall sensörü polling (interrupt olmadığı için)
+bool lastHallState = false;
+void pollHall() {
+    bool state = digitalRead(READ_PIN);
+    if (state && !lastHallState) {
+        pulseCount++;
+    }
+    lastHallState = state;
 }
 
 void loop() {
     mySerial.update();
+    pollHall(); // Her loop'ta Hall sensörünü oku
 
-    // FIX 3: Ham analogRead yerine filtrelenmiş hız kullanılıyor
-    currentSpeed = getFilteredSpeed();
+    // Hızı 100ms'de bir güncelle
+    unsigned long su_anki_zaman = millis();
+    if (su_anki_zaman - eski_zaman >= 100) {
+        eski_zaman = su_anki_zaman;
+        currentSpeed = getSpeedFromHall() * (lastGear == FORWARD ? 1 : -1);
+        handleControl();
+    }
 
-    // FAILSAFE: 500ms'den uzun süre paket gelmezse dur
+    // FAILSAFE
     if (millis() - lastPacketReceivedTime > FAILSAFE_TIMEOUT_MS) {
         targetSpeed = 0;
     }
@@ -313,12 +347,5 @@ void loop() {
     if (millis() - lastSendTime > 20) {
         sendFeedbackData();
         lastSendTime = millis();
-    }
-
-    // 10Hz kontrol döngüsü
-    unsigned long su_anki_zaman = millis();
-    if (su_anki_zaman - eski_zaman >= 100) {
-        eski_zaman = su_anki_zaman;
-        handleControl();
     }
 }

@@ -3,9 +3,13 @@
 #include "ServoTimer2.h"
 #include "Settings2.h"
 
-#define DEBUG
+// #define DEBUG
 
 #define MY_NODE_ID 2
+
+// CommCaster.py CMD sabitleri
+#define CMD_SET_SPEED    0x21
+#define CMD_REPORT_SPEED 0x22
 
 PacketSerial mySerial;
 ServoTimer2 brakeServo;
@@ -16,8 +20,8 @@ ServoTimer2 brakeServo;
 CarState carState = STATE_IDLE;
 SubState subState = SUB_NONE;
 
-int16_t target_speed  = 0;   // Mega'dan gelen hedef hız (PacketSerial üzerinden)
-int8_t  targetSpeed   = 0;   // State machine'in kullandığı tip (orijinal koddaki gibi)
+int16_t target_speed  = 0;
+int8_t  targetSpeed   = 0;
 int8_t  currentSpeed  = 0;
 GearState lastGear    = FORWARD;
 
@@ -26,44 +30,37 @@ float integral_hata = 0.0;
 float Kp = 2.5;
 float Ki = 0.5;
 float dt = 0.1;
-static int onceki_pwm = 0;  // PWM rampa sınırlayıcı
+static int onceki_pwm = 0;
 
-// KALKIŞ İVMESİ (Sahada bu rakamı değiştirerek kalkış sertliğini ayarlayabilirsin)
 int RAMPA_ADIMI = 15;
 
-// PREPARING zamanlayıcısı (Debriyaj Etkisi)
+// PREPARING zamanlayıcısı
 unsigned long prepareStartTime = 0;
-const unsigned long PREPARE_DURATION_MS = 400;  // 400ms içinde fren sıfıra iner
-int prepareBrakePercent = 100;                   // fren yüzdesi kademeli düşer
+const unsigned long PREPARE_DURATION_MS = 400;
+int prepareBrakePercent = 100;
 
 // Ana döngü zamanlayıcısı
 unsigned long eski_zaman = 0;
 
-// Sensör gürültüsüne / ani sıçramaya karşı güvenlik payı
+// Sıfır hız teyit sayacı
 uint8_t zeroSpeedStreak = 0;
 const uint8_t ZERO_SPEED_CONFIRM_COUNT = 3;
 
-// -------------------------------------------------------
-// PACKETSERIAL HABERLEŞME
-// -------------------------------------------------------
-// CommCaster.py paket formatı:
-//   [node_id(1)] [cmd(1)] [payload(2)] [CRC32(4)] = 8 byte
-//
-// Geri bildirim paketi (feedback):
-//   [node_id(1)] [cmd(1)] [payload(2)] [CRC32(4)] = 8 byte
-//
-// CommCaster.py CMD sabitleri:
-#define CMD_SET_SPEED    0x21
-#define CMD_REPORT_SPEED 0x22
-
+// PacketSerial zamanlayıcıları
 unsigned long lastSendTime = 0;
 unsigned long lastPacketReceivedTime = 0;
 const unsigned long FAILSAFE_TIMEOUT_MS = 500;
 
+// -------------------------------------------------------
+// FORWARD DECLARATIONS
+// -------------------------------------------------------
 void onPacketReceived(const uint8_t* buffer, size_t size);
 void sendFeedbackData();
 uint32_t calculateCRC32(const uint8_t *data, size_t length);
 
+// -------------------------------------------------------
+// CRC32
+// -------------------------------------------------------
 uint32_t calculateCRC32(const uint8_t *data, size_t length) {
     uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < length; i++) {
@@ -77,18 +74,7 @@ uint32_t calculateCRC32(const uint8_t *data, size_t length) {
 }
 
 // -------------------------------------------------------
-// DEBUG İŞLEMLERİ
-// -------------------------------------------------------
-#ifdef DEBUG
-bool ledState = false;
-void triggerLed() {
-    digitalWrite(LED_BUILTIN, ledState);
-    ledState = !ledState;
-}
-#endif
-
-// -------------------------------------------------------
-// DONANIM SOYUTLAMA KATMANI (FİZİKSEL ÇIKIŞLAR)
+// DONANIM SOYUTLAMA KATMANI
 // -------------------------------------------------------
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
@@ -105,8 +91,8 @@ void setBrakeDynamic(int yuzde) {
 }
 
 uint8_t getSpeedScaled() {
-   float scaled = analogRead(READ_PIN) / 5.0;
-   float mapped = mapFloat(scaled, SPEED_IN_MIN, SPEED_IN_MAX, 0, SPEED_RES);
+    float scaled = analogRead(READ_PIN) / 5.0;
+    float mapped = mapFloat(scaled, SPEED_IN_MIN, SPEED_IN_MAX, 0, SPEED_RES);
     if (scaled < 5) return 0;
     return constrain((int)round(mapped), 0, SPEED_RES);
 }
@@ -120,24 +106,22 @@ void setSpeedScaled(uint8_t _speed) {
     }
 }
 
-
 // -------------------------------------------------------
-// OTONOM KONTROL DÖNGÜSÜ (BEYİN)
+// KONTROL DÖNGÜSÜ
 // -------------------------------------------------------
 void handleControl() {
     float hata = abs(targetSpeed) - abs(currentSpeed);
-    int pwm_komut        = 0;
+    int pwm_komut = 0;
     int fren_komut_yuzdesi = 0;
 
-    // --- STATE (DURUM) GEÇİŞ KARARLARI ---
+    // --- STATE GEÇİŞ KARARLARI ---
     switch (carState) {
 
         case STATE_IDLE:
             if (targetSpeed != 0) {
-                carState           = STATE_PREPARING;
-                prepareStartTime   = millis();
+                carState            = STATE_PREPARING;
+                prepareStartTime    = millis();
                 prepareBrakePercent = 100;
-
                 if (targetSpeed > 0) setGear(FORWARD);
                 if (targetSpeed < 0) setGear(BACKWARD);
             }
@@ -148,12 +132,10 @@ void handleControl() {
                 carState = STATE_IDLE;
                 break;
             }
-
             {
                 unsigned long gecen = millis() - prepareStartTime;
                 prepareBrakePercent = map(gecen, 0, PREPARE_DURATION_MS, 100, 0);
                 prepareBrakePercent = constrain(prepareBrakePercent, 0, 100);
-
                 if (gecen >= PREPARE_DURATION_MS) {
                     prepareBrakePercent = 0;
                     carState            = STATE_CRUISING;
@@ -180,7 +162,6 @@ void handleControl() {
             } else {
                 zeroSpeedStreak = 0;
             }
-
             if (zeroSpeedStreak >= ZERO_SPEED_CONFIRM_COUNT) {
                 carState = STATE_IDLE;
                 subState = SUB_NONE;
@@ -195,7 +176,7 @@ void handleControl() {
             break;
     }
 
-    // --- DURUMLARIN FİZİKSEL ÇIKTILARI ---
+    // --- FİZİKSEL ÇIKTILAR ---
     switch (carState) {
 
         case STATE_IDLE:
@@ -211,26 +192,22 @@ void handleControl() {
             onceki_pwm = 0;
             break;
 
-        case STATE_CRUISING:
+        case STATE_CRUISING: {
             fren_komut_yuzdesi = 0;
-
             integral_hata += hata * dt;
             float pi_cikis = (Kp * hata) + (Ki * integral_hata);
             pwm_komut = (int)constrain(pi_cikis * 2, 0, SPEED_RES);
-
-            // YUMUŞAK KALKIŞ (RAMPA) KONTROLÜ
             if (pwm_komut > onceki_pwm + RAMPA_ADIMI) {
                 pwm_komut = onceki_pwm + RAMPA_ADIMI;
             }
-
             onceki_pwm = pwm_komut;
             setSpeedScaled(pwm_komut);
             break;
+        }
 
         case STATE_DECELERATING:
             setSpeedScaled(0);
             integral_hata = 0.0;
-
             if (subState == SUB_BRAKING) {
                 fren_komut_yuzdesi = (int)min(100.0f, abs(hata) * 6.0f);
             } else {
@@ -240,69 +217,52 @@ void handleControl() {
     }
 
     setBrakeDynamic(fren_komut_yuzdesi);
-
-// --- SERİ PORT BİLGİLENDİRME ---
-#ifdef DEBUG
-    const char* stateStr[] = {"IDLE", "PREPARING", "CRUISING", "DECELERATING"};
-    const char* subStr[]   = {"NONE", "COASTING", "BRAKING"};
-    Serial.print("DURUM: ");    Serial.print(stateStr[carState]);
-    Serial.print(" | SUB: ");   Serial.print(subStr[subState]);
-    Serial.print(" | Hedef: "); Serial.print(targetSpeed);
-    Serial.print(" | Anlik: "); Serial.print(currentSpeed);
-    Serial.print(" | Motor: "); Serial.print(pwm_komut);
-    Serial.print(" | Fren: %"); Serial.println(fren_komut_yuzdesi);
-#endif
 }
 
 // -------------------------------------------------------
-// PACKETSERIAL ALICI / VERİCİ
+// PACKETSERIAL ALICI
+// Paket formatı: [node_id(1)][cmd(1)][payload(2)][CRC32(4)] = 8 byte
 // -------------------------------------------------------
 void onPacketReceived(const uint8_t* buffer, size_t size) {
-  // FIX: CommCaster.py formatı: [node_id(1)][cmd(1)][payload(2)][CRC32(4)] = 8 byte
-  if (size < 8) return;
+    if (size < 8) return;
 
-  // Son 4 byte CRC
-  uint32_t receivedCRC;
-  memcpy(&receivedCRC, buffer + (size - 4), 4);
-  uint32_t calculatedCRC = calculateCRC32(buffer, size - 4);
+    uint32_t receivedCRC;
+    memcpy(&receivedCRC, buffer + (size - 4), 4);
+    uint32_t calculatedCRC = calculateCRC32(buffer, size - 4);
+    if (receivedCRC != calculatedCRC) return;
 
-  if (receivedCRC != calculatedCRC) return;
+    uint8_t incoming_id  = buffer[0];
+    uint8_t incoming_cmd = buffer[1];
 
-  uint8_t incoming_id  = buffer[0];
-  uint8_t incoming_cmd = buffer[1];  // FIX: cmd byte okunuyor
-
-  if (incoming_id == MY_NODE_ID && incoming_cmd == CMD_SET_SPEED) {
-    lastPacketReceivedTime = millis();
-
-    
-    memcpy(&target_speed, buffer + 2, 2);
-
-#ifdef DEBUG
-    triggerLed();
-#endif
-
-    targetSpeed = (int8_t)constrain(target_speed, -SPEED_RES, SPEED_RES);
-  }
-}
-
-void sendFeedbackData() {
-  uint8_t payload[4];
-  payload[0] = MY_NODE_ID;
-  payload[1] = CMD_REPORT_SPEED;
-  int16_t feedback_value = currentSpeed;
-  memcpy(payload + 2, &feedback_value, 2);
-
-  uint32_t crc = calculateCRC32(payload, 4);
-
-  uint8_t packet[8];
-  memcpy(packet, payload, 4);
-  memcpy(packet + 4, &crc, 4);
-
-  mySerial.send(packet, sizeof(packet));
+    if (incoming_id == MY_NODE_ID && incoming_cmd == CMD_SET_SPEED) {
+        lastPacketReceivedTime = millis();
+        memcpy(&target_speed, buffer + 2, 2);
+        targetSpeed = (int8_t)constrain(target_speed, -SPEED_RES, SPEED_RES);
+    }
 }
 
 // -------------------------------------------------------
-// KURULUM VE ANA DÖNGÜ
+// PACKETSERIAL VERİCİ
+// Feedback formatı: [node_id(1)][cmd(1)][payload(2)][CRC32(4)] = 8 byte
+// -------------------------------------------------------
+void sendFeedbackData() {
+    uint8_t payload[4];
+    payload[0] = MY_NODE_ID;
+    payload[1] = CMD_REPORT_SPEED;
+    int16_t feedback_value = currentSpeed;
+    memcpy(payload + 2, &feedback_value, 2);
+
+    uint32_t crc = calculateCRC32(payload, 4);
+
+    uint8_t packet[8];
+    memcpy(packet, payload, 4);
+    memcpy(packet + 4, &crc, 4);
+
+    mySerial.send(packet, sizeof(packet));
+}
+
+// -------------------------------------------------------
+// SETUP & LOOP
 // -------------------------------------------------------
 void setup() {
     Serial.begin(115200);
@@ -314,10 +274,6 @@ void setup() {
     pinMode(GEAR_PIN,  OUTPUT);
     pinMode(READ_PIN,  INPUT);
     pinMode(11,        OUTPUT);
-
-#ifdef DEBUG
-    pinMode(LED_BUILTIN, OUTPUT);
-#endif
 
     setSpeedScaled(0);
     setBrakeDynamic(100);
@@ -331,17 +287,18 @@ void loop() {
 
     currentSpeed = getSpeedScaled() * (lastGear == FORWARD ? 1 : -1);
 
-    // HARDWARE FAILSAFE
+    // FAILSAFE: 500ms'den uzun süre paket gelmezse dur
     if (millis() - lastPacketReceivedTime > FAILSAFE_TIMEOUT_MS) {
         targetSpeed = 0;
     }
 
-    // Mega'ya hız geri bildirimini 50Hz'de gönder
+    // 50Hz feedback
     if (millis() - lastSendTime > 20) {
         sendFeedbackData();
         lastSendTime = millis();
     }
 
+    // 10Hz kontrol döngüsü
     unsigned long su_anki_zaman = millis();
     if (su_anki_zaman - eski_zaman >= 100) {
         eski_zaman = su_anki_zaman;
